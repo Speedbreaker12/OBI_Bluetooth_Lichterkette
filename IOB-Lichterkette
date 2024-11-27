@@ -1,0 +1,166 @@
+const { exec } = require('child_process');
+
+// MAC-Adresse des Geräts und Handle der GATT-Characteristic
+const deviceAddress = '24:35:02:27:DE:6E';
+const characteristicHandle = '0x0025';
+
+// Pfade zu den Datenpunkten
+const datapointOnOff = 'javascript.0.MeineVariablen.Lichterkette_OnOff';
+const datapointBrightness = 'javascript.0.MeineVariablen.Lichterkette_Helligkeit';
+
+// Warteschlange und Status
+const actionQueue = [];
+let isProcessing = false;
+
+// Funktion: Shell-Befehl ausführen mit Debugging und Timeout
+function executeCommand(command, timeout = 10000) {
+    console.log(`Führe aus: ${command}`);
+    return new Promise((resolve, reject) => {
+        const process = exec(command, (error, stdout, stderr) => {
+            if (error) {
+                console.error(`Fehler: ${stderr || error.message}`);
+                return reject(stderr || error.message);
+            }
+            console.log(`Erfolg: ${stdout}`);
+            resolve(stdout.trim());
+        });
+
+        setTimeout(() => {
+            process.kill('SIGTERM');
+            reject('Befehl abgebrochen (Timeout)');
+        }, timeout);
+    });
+}
+
+// Funktion: GATT-Wert schreiben mit Wiederholungslogik
+async function writeGattValueWithRetries(value, maxRetries = 10, initialDelay = 500) {
+    let attempts = 0;
+    let delay = initialDelay;
+
+    while (attempts < maxRetries) {
+        try {
+            console.log(`Versuch ${attempts + 1}/${maxRetries}: Sende GATT-Befehl`);
+            await writeGattValue(value);
+            console.log('Befehl erfolgreich gesendet.');
+            return; // Erfolgreich, keine weiteren Versuche notwendig
+        } catch (error) {
+            attempts++;
+            console.error(`Fehler beim Senden (Versuch ${attempts}):`, error);
+            if (attempts >= maxRetries) {
+                console.error('Maximale Anzahl an Versuchen erreicht. Abbruch.');
+                throw new Error('GATT-Befehl konnte nach mehreren Versuchen nicht gesendet werden.');
+            }
+            console.log(`Warte ${delay} ms vor erneutem Versuch...`);
+            await new Promise((resolve) => setTimeout(resolve, delay));
+            delay *= 2; // Verzögerung verdoppeln
+        }
+    }
+}
+
+// Funktion: GATT-Wert schreiben
+async function writeGattValue(value) {
+    const command = `gatttool -b ${deviceAddress} --char-write-req --handle=${characteristicHandle} --value="${value}"`;
+    console.log(`Sende GATT-Befehl: ${command}`);
+    try {
+        const output = await executeCommand(command);
+        console.log(`GATT-Befehl erfolgreich: ${output}`);
+    } catch (error) {
+        console.error('Fehler beim Schreiben auf die GATT-Characteristic:', error);
+        throw new Error('GATT-Wert konnte nicht geschrieben werden.');
+    }
+}
+
+// Funktion: Helligkeit berechnen
+function calculateBrightnessHex(brightnessPercent) {
+    const brightnessHex = Math.round((brightnessPercent / 100) * 0x64).toString(16).padStart(2, '0');
+    return `030101${brightnessHex}`;
+}
+
+// Funktion: Lichterkette steuern
+async function controlLight(action, brightness = null) {
+    try {
+        if (action) {
+            if (brightness !== null) {
+                const brightnessValue = calculateBrightnessHex(brightness);
+                await writeGattValueWithRetries(brightnessValue);
+            } else {
+                const value = action === 'on' ? '01010101' : '01010100';
+                await writeGattValueWithRetries(value);
+            }
+        }
+    } catch (error) {
+        console.error('Fehler bei der Steuerung der Lichterkette:', error);
+    }
+}
+
+// Funktion: Warteschlange abarbeiten
+async function processQueue() {
+    if (isProcessing) return; // Verhindert gleichzeitige Verarbeitung
+
+    isProcessing = true;
+    while (actionQueue.length > 0) {
+        const { action, brightness } = actionQueue.shift(); // Nächsten Befehl aus der Warteschlange holen
+        console.log(`Verarbeite Aktion: ${action}, Helligkeit: ${brightness}`);
+        await controlLight(action, brightness);
+    }
+    isProcessing = false;
+}
+
+// Datenpunkte erstellen, falls nicht vorhanden
+createState(datapointOnOff, false, {
+    name: 'Lichterkette On/Off',
+    type: 'boolean',
+    role: 'switch',
+    read: true,
+    write: true,
+    def: false
+}, () => {
+    // Event Listener für Zustandsänderungen registrieren
+    on({ id: datapointOnOff, change: 'ne' }, async (obj) => {
+        const action = obj.state.val ? 'on' : 'off';
+        actionQueue.push({ action, brightness: null });
+        processQueue();
+    });
+});
+
+createState(datapointBrightness, 100, {
+    name: 'Lichterkette Helligkeit',
+    type: 'number',
+    role: 'level.dimmer',
+    read: true,
+    write: true,
+    def: 100,
+    min: 0,
+    max: 100
+}, () => {
+    // Event Listener für Helligkeitsänderungen registrieren
+    on({ id: datapointBrightness, change: 'ne' }, async (obj) => {
+        const brightness = obj.state.val;
+
+        if (brightness < 3) {
+            // Wenn Helligkeit unter 3%, Lichterkette ausschalten
+            console.log('Helligkeit unter 3% - Lichterkette wird ausgeschaltet.');
+            setState(datapointOnOff, false); // Setzt On/Off-Datenpunkt auf false
+        } else {
+            // Ansonsten Helligkeit setzen
+            actionQueue.push({ action: 'on', brightness });
+            processQueue();
+        }
+    });
+});
+
+// Debugging: Manuelle Steuerung
+/*(async () => {
+    try {
+        console.log('Teste Steuerung: Einschalten mit 50% Helligkeit...');
+        actionQueue.push({ action: 'on', brightness: 50 });
+        processQueue();
+
+        console.log('Teste Steuerung: Ausschalten...');
+        actionQueue.push({ action: 'off', brightness: null });
+        processQueue();
+    } catch (error) {
+        console.error('Fehler bei manueller Steuerung:', error);
+    }
+})();
+*/
