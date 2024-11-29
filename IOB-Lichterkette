@@ -1,7 +1,6 @@
 const { exec } = require('child_process');
 
 // **Konstanten**
-const MAX_RETRIES = 10;
 let bluetoothAdapter = 'hci0';
 const deviceAddress = '24:35:02:27:DE:6E';
 const characteristicHandle = '0x0025';
@@ -12,16 +11,17 @@ const pushoverDevice = 'iphone-Fabian';
 const actionQueue = [];
 let isProcessing = false;
 let isResetting = false;
+const MAX_RETRIES = 20;
 
 // Funktion: Bluetooth-Adapter aktivieren
 function activateBluetoothAdapter() {
     return new Promise((resolve, reject) => {
         exec(`hciconfig ${bluetoothAdapter} up`, (error, stdout, stderr) => {
             if (error) {
-                log(`Fehler beim Aktivieren des Adapters ${bluetoothAdapter}: ${stderr || error.message}`, 'error');
+                log(`❌ Fehler beim Aktivieren des Adapters ${bluetoothAdapter}: ${stderr || error.message}`, 'error');
                 return reject(`Adapter ${bluetoothAdapter} konnte nicht aktiviert werden.`);
             }
-            log(`Bluetooth-Adapter ${bluetoothAdapter} aktiviert: ${stdout.trim()}`, 'info');
+            log(`✅ Bluetooth-Adapter ${bluetoothAdapter} erfolgreich aktiviert: ${stdout.trim()}`, 'info');
             resolve();
         });
     });
@@ -45,7 +45,7 @@ function executeCommand(command, timeout = 20000) {
                 );
 
                 const logLevel = isWarningError ? 'warn' : 'error';
-                log(`Fehler beim Ausführen des Befehls: ${stderr || error.message}`, logLevel);
+                log(`❌ Fehler beim Ausführen des Befehls: ${stderr || error.message}`, logLevel);
                 return reject(stderr || error.message);
             }
             clearTimeout(timeoutId);
@@ -62,81 +62,102 @@ function executeCommand(command, timeout = 20000) {
 // Funktion: GATT-Wert schreiben
 async function writeGattValue(value) {
     const command = `gatttool -i ${bluetoothAdapter} -b ${deviceAddress} --char-write-req --handle=${characteristicHandle} --value="${value}"`;
+    log(`📡 Sende GATT-Wert: ${value}`, 'info');
     return executeCommand(command);
 }
 
 // Wiederholtes Schreiben mit Validierung und Logging
 async function writeGattValueWithRetries(value, oldValue, datapoint, initialDelay = 5000) {
     if (!datapoint) {
-        log('Fehler: Datenpunkt ist nicht definiert!', 'error');
+        log('❌ Fehler: Datenpunkt ist nicht definiert!', 'error');
         throw new Error('Datenpunkt für writeGattValueWithRetries ist undefined.');
     }
+
+    log(`⚙️ writeGattValueWithRetries gestartet:`, 'info');
+    log(`  - Wert: ${value}`, 'info');
+    log(`  - Alter Wert: ${oldValue}`, 'info');
+    log(`  - Datenpunkt: ${datapoint}`, 'info');
 
     let attempts = 0;
     let delay = initialDelay;
 
     while (attempts < MAX_RETRIES) {
         try {
-            log(`Start von writeGattValueWithRetries für Wert: ${value}`, 'debug');
-            log(`Versuch ${attempts + 1}/${MAX_RETRIES}: Sende GATT-Wert`, 'info');
+            log(`🔄 Versuch ${attempts + 1}/${MAX_RETRIES}: Sende GATT-Wert`, 'info');
             await writeGattValue(value);
-            log('GATT-Wert erfolgreich gesendet.', 'info');
-            return;
+            log(`✅ GATT-Wert erfolgreich gesendet.`, 'info');
+            return; // Erfolgreich, keine weiteren Versuche nötig
         } catch (error) {
             attempts++;
-            log(`Warnung beim Senden (Versuch ${attempts}/${MAX_RETRIES}): ${error}`, 'warn');
+            log(`⚠️ Warnung beim Senden (Versuch ${attempts}/${MAX_RETRIES}): ${error}`, 'warn');
             if (attempts >= MAX_RETRIES) {
-                log('Maximale Anzahl an Versuchen erreicht. Abbruch.', 'error');
+                log('❌ Maximale Anzahl an Versuchen erreicht. Abbruch.', 'error');
 
                 // Sicheres Zurücksetzen
                 if (oldValue !== undefined && oldValue !== null) {
                     isResetting = true;
+                    log(`🔙 Setze Datenpunkt "${datapoint}" auf den alten Wert: ${oldValue}`, 'info');
                     setState(datapoint, oldValue, true);
-                    log(`Datenpunkt "${datapoint}" auf den alten Wert zurückgesetzt: ${oldValue}`, 'info');
                     isResetting = false;
                 } else {
-                    log(`Fehler: Alter Wert für "${datapoint}" ist undefined oder null. Kein Zurücksetzen möglich.`, 'error');
+                    log(`❌ Fehler: Alter Wert für "${datapoint}" ist undefined oder null. Kein Zurücksetzen möglich.`, 'error');
                 }
 
                 sendPushoverNotification(
-                    `Befehl konnte nach ${MAX_RETRIES} Versuchen nicht gesendet werden: ${value}`
+                    `❌ Befehl konnte nach ${MAX_RETRIES} Versuchen nicht gesendet werden: ${value}`
                 );
                 throw new Error('GATT-Befehl konnte nach mehreren Versuchen nicht gesendet werden.');
             }
             await new Promise((resolve) => setTimeout(resolve, delay));
-            delay *= 1.1;
+            delay *= 1.1; // Erhöhe die Verzögerung bei jedem Versuch
         }
     }
 }
 
+// Verbesserte Warteschlangenverarbeitung
 async function processQueue() {
     if (isProcessing) {
-        log('Warteschlange wird bereits verarbeitet. Vorgang abgebrochen.', 'debug');
+        log('⏳ Warteschlange wird bereits verarbeitet. Vorgang abgebrochen.', 'info');
         return;
     }
 
     if (actionQueue.length === 0) {
-        log('Warteschlange ist leer. Keine Aktionen zu verarbeiten.', 'info');
-        isProcessing = false;
+        log('✅ Warteschlange ist leer. Keine Aktionen zu verarbeiten.', 'info');
         return;
     }
 
-    log('Beginne Verarbeitung der Warteschlange...', 'info');
+    log(`📋 Starte Verarbeitung der Warteschlange (Aktuell: ${actionQueue.length} Aktionen)...`, 'info');
     isProcessing = true;
 
     while (actionQueue.length > 0) {
-        const { action, brightness } = actionQueue[0]; // Verarbeite immer das erste Element der Warteschlange
+        const currentAction = actionQueue[0]; // Verarbeite immer das erste Element der Warteschlange
+
+        log(`⚙️ Verarbeite Aktion: ${JSON.stringify(currentAction)}`, 'info');
 
         try {
-            await controlLight(action, brightness);
-            actionQueue.shift(); // Entferne die Aktion nach erfolgreicher Verarbeitung
+            if (currentAction.brightness !== null) {
+                // Helligkeitsänderung
+                const brightnessValue = calculateBrightnessHex(currentAction.brightness);
+                await writeGattValueWithRetries(brightnessValue, currentAction.oldValue, datapointBrightness);
+                log(`✅ Helligkeitsbefehl gesendet: ${currentAction.brightness}%`, 'info');
+            } else if (currentAction.action === 'on' || currentAction.action === 'off') {
+                // On/Off-Aktion
+                const value = currentAction.action === 'on' ? '01010101' : '01010100';
+                await writeGattValueWithRetries(value, currentAction.oldValue, datapointOnOff);
+                log(`✅ On/Off-Befehl gesendet: ${currentAction.action}`, 'info');
+            } else {
+                log(`⚠️ Unbekannte Aktion: ${JSON.stringify(currentAction)}`, 'warn');
+            }
         } catch (error) {
-            log(`Fehler beim Abarbeiten der Warteschlange: ${error}`, 'error');
+            log(`❌ Fehler bei der Aktion: ${JSON.stringify(currentAction)}. Fehler: ${error}`, 'error');
+        } finally {
+            actionQueue.shift(); // Entferne die Aktion nach der Verarbeitung, unabhängig vom Ergebnis
+            log(`🔄 Verbleibende Aktionen in der Warteschlange: ${actionQueue.length}`, 'info');
         }
     }
 
-    log('Verarbeitung der Warteschlange abgeschlossen.', 'info');
-    isProcessing = false; // Setze den Status korrekt zurück
+    log('✅ Verarbeitung der Warteschlange abgeschlossen.', 'info');
+    isProcessing = false; // Setze das Flag zurück, nachdem die Verarbeitung beendet ist
 }
 
 // Kontrolle der Lampe (On/Off oder Helligkeit)
@@ -162,82 +183,58 @@ function sendPushoverNotification(message) {
         title: "Lichterkette Fehler",
         device: pushoverDevice
     });
+    log(`📱 Pushover-Benachrichtigung gesendet: ${message}`, 'info');
 }
 
 function calculateBrightnessHex(brightnessPercent) {
     return `030101${Math.round((brightnessPercent / 100) * 0x64).toString(16).padStart(2, '0')}`;
 }
 
+// Listener für On/Off-Datenpunkt
 on({ id: datapointOnOff, change: 'ne' }, async (obj) => {
     if (isResetting || obj.state.ack) return;
 
     const desiredState = obj.state.val;
+    const oldValue = obj.oldState?.val ?? getState(obj.id)?.val ?? false;
 
-    // Debug-Logs für `obj.oldState`
-    log(`Trigger ausgelöst für On/Off:`, 'info');
-    log(`- Alter Zustand (obj.oldState): ${JSON.stringify(obj.oldState)}`, 'debug');
-    log(`- Alter Wert (obj.oldState.val): ${obj.oldState?.val}`, 'debug');
-    log(`- Neuer Wert (obj.state.val): ${desiredState}`, 'debug');
+    log(`📥 On/Off-Trigger ausgelöst:`, 'info');
+    log(`  - Neuer Wert: ${desiredState}`, 'info');
+    log(`  - Alter Wert (obj.oldState.val): ${obj.oldState?.val ?? 'nicht verfügbar'}`, 'info');
+    log(`  - Verwendeter Fallback-Wert: ${oldValue}`, 'info');
 
-    const oldOnOffValue = obj.oldState?.val ?? getState(obj.id)?.val ?? false;
-
-    log(`- Verwendeter alter On/Off-Wert (Fallback berücksichtigt): ${oldOnOffValue}`, 'debug');
-
-    if (desiredState === oldOnOffValue) return;
-
-    const actionExists = actionQueue.some((entry) => entry.action === (desiredState ? 'on' : 'off'));
-    if (actionExists) {
-        log('Aktion bereits in der Warteschlange. Kein erneuter Eintrag.', 'debug');
+    if (desiredState === oldValue) {
+        log('ℹ️ Neuer Wert entspricht dem alten Wert. Keine Aktion erforderlich.', 'info');
         return;
     }
 
-    try {
-        actionQueue.push({ action: desiredState ? 'on' : 'off', brightness: null });
-        await processQueue();
-    } catch (error) {
-        log(`Fehler beim On/Off-Event: ${error}`, 'error');
-    }
+    actionQueue.push({ action: desiredState ? 'on' : 'off', brightness: null, oldValue: oldValue });
+    log(`➕ Aktion zur Warteschlange hinzugefügt: ${desiredState ? 'on' : 'off'}`, 'info');
+    await processQueue();
 });
 
+// Listener für Helligkeits-Datenpunkt
 on({ id: datapointBrightness, change: 'ne' }, async (obj) => {
     if (isResetting || obj.state.ack) return;
 
     const desiredBrightness = obj.state.val;
+    const oldBrightness = obj.oldState?.val ?? getState(obj.id)?.val ?? 100;
 
-    // Debug-Logs für `obj.oldState`
-    log(`Trigger ausgelöst für Helligkeit:`, 'info');
-    log(`- Alter Zustand (obj.oldState): ${JSON.stringify(obj.oldState)}`, 'debug');
-    log(`- Alter Wert (obj.oldState.val): ${obj.oldState?.val}`, 'debug');
-    log(`- Neuer Wert (obj.state.val): ${desiredBrightness}`, 'debug');
+    log(`📥 Helligkeits-Trigger ausgelöst:`, 'info');
+    log(`  - Neuer Wert: ${desiredBrightness}`, 'info');
+    log(`  - Alter Wert (obj.oldState.val): ${obj.oldState?.val ?? 'nicht verfügbar'}`, 'info');
+    log(`  - Verwendeter Fallback-Wert: ${oldBrightness}`, 'info');
 
-    const oldBrightnessValue = obj.oldState?.val ?? getState(obj.id)?.val ?? 100;
-
-    log(`- Verwendeter alter Helligkeitswert (Fallback berücksichtigt): ${oldBrightnessValue}`, 'debug');
-
-    if (desiredBrightness === oldBrightnessValue) return;
-
-    const actionExists = actionQueue.some(
-        (entry) => entry.brightness === desiredBrightness
-    );
-    if (actionExists) {
-        log('Aktion bereits in der Warteschlange. Kein erneuter Eintrag.', 'debug');
+    if (desiredBrightness === oldBrightness) {
+        log('ℹ️ Neuer Wert entspricht dem alten Wert. Keine Aktion erforderlich.', 'info');
         return;
     }
 
-    try {
-        if (desiredBrightness < 3) {
-            setState(datapointOnOff, false, true);
-        } else {
-            const brightnessValue = calculateBrightnessHex(desiredBrightness);
-            log(`Alter Wert vor Übergabe an writeGattValueWithRetries: ${oldBrightnessValue}`, 'debug');
-            actionQueue.push({ action: 'on', brightness: desiredBrightness });
-            await processQueue();
-        }
-    } catch (error) {
-        log(`Fehler beim Helligkeits-Event: ${error}`, 'error');
-    }
+    actionQueue.push({ action: 'on', brightness: desiredBrightness, oldValue: oldBrightness });
+    log(`➕ Aktion zur Warteschlange hinzugefügt: Helligkeit auf ${desiredBrightness}%`, 'info');
+    await processQueue();
 });
 
+// Sicherstellen, dass die Datenpunkte existieren
 async function ensureStateExists(id, initialValue, common) {
     const state = await getObjectAsync(id);
     if (!state) {
@@ -263,11 +260,12 @@ await ensureStateExists(datapointBrightness, 100, {
     max: 100
 });
 
+// Skriptstart
 (async () => {
     try {
         await activateBluetoothAdapter();
         await processQueue();
     } catch (error) {
-        log(`Fehler beim Start des Skripts: ${error}`, 'error');
+        log(`❌ Fehler beim Start des Skripts: ${error}`, 'error');
     }
 })();
